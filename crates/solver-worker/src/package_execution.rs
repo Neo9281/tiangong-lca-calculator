@@ -1939,14 +1939,30 @@ fn parse_package_entries(zip_bytes: &[u8]) -> anyhow::Result<Vec<PackageEntry>> 
     let mut archive = ZipArchive::new(cursor)?;
 
     let manifest_content = read_zip_file_string(&mut archive, "manifest.json")?;
-    if let Some(content) = manifest_content {
-        let manifest: PackageManifest = serde_json::from_str(content.as_str())?;
-        if manifest.version == PACKAGE_MANIFEST_VERSION && !manifest.entries.is_empty() {
-            return parse_manifest_package_entries(&mut archive, &manifest);
+    if let Some(content) = manifest_content
+        && let Ok(manifest) = serde_json::from_str::<PackageManifest>(content.as_str())
+    {
+        if !manifest.entries.is_empty() {
+            let entries = parse_manifest_package_entries(&mut archive, &manifest)?;
+            if !entries.is_empty() {
+                return Ok(backfill_process_model_ids(entries));
+            }
+        }
+
+        let inferred_entries = parse_folder_package_entries(&mut archive, Some(&manifest))?;
+        if !inferred_entries.is_empty() {
+            return Ok(backfill_process_model_ids(inferred_entries));
         }
     }
 
-    parse_legacy_package_entries(&mut archive)
+    let inferred_entries = parse_folder_package_entries(&mut archive, None)?;
+    if !inferred_entries.is_empty() {
+        return Ok(backfill_process_model_ids(inferred_entries));
+    }
+
+    Ok(backfill_process_model_ids(parse_legacy_package_entries(
+        &mut archive,
+    )?))
 }
 
 async fn find_conflicts(pool: &PgPool, entries: &[PackageEntry]) -> anyhow::Result<ConflictSets> {
@@ -2513,6 +2529,57 @@ fn parse_manifest_package_entries<R: Read + Seek>(
     Ok(dedupe_entries(entries))
 }
 
+fn parse_folder_package_entries<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    manifest: Option<&PackageManifest>,
+) -> anyhow::Result<Vec<PackageEntry>> {
+    let manifest_entries = manifest
+        .map(|value| {
+            value
+                .entries
+                .iter()
+                .map(|entry| (entry.file_path.as_str(), entry))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let mut entries = Vec::new();
+    for index in 0..archive.len() {
+        let file_path = {
+            let file = archive.by_index(index)?;
+            if file.is_dir() {
+                continue;
+            }
+            file.name().to_owned()
+        };
+
+        if file_path == "manifest.json"
+            || !std::path::Path::new(&file_path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            continue;
+        }
+
+        let Some((table, id, version)) = parse_root_from_package_file_path(file_path.as_str())
+        else {
+            continue;
+        };
+        let Some(content) = read_zip_file_string(archive, file_path.as_str())? else {
+            continue;
+        };
+        let parsed = serde_json::from_str::<Value>(content.as_str())?;
+
+        if let Some(meta) = manifest_entries.get(file_path.as_str()) {
+            entries.push(normalize_manifest_dataset_payload(table, parsed, meta));
+        } else {
+            entries.push(normalize_path_dataset_payload(table, id, &version, parsed));
+        }
+    }
+
+    Ok(dedupe_entries(entries))
+}
+
 fn parse_legacy_package_entries<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
 ) -> anyhow::Result<Vec<PackageEntry>> {
@@ -2633,6 +2700,50 @@ fn normalize_manifest_dataset_payload(
     }
 }
 
+fn normalize_path_dataset_payload(
+    table: PackageRootTable,
+    id: Uuid,
+    version: &str,
+    dataset: Value,
+) -> PackageEntry {
+    if table != PackageRootTable::Lifecyclemodels {
+        return PackageEntry {
+            table,
+            id,
+            version: normalize_version_string(version),
+            json_ordered: dataset,
+            json_tg: None,
+            model_id: None,
+            rule_verification: true,
+        };
+    }
+
+    if let Value::Object(mut candidate) = dataset {
+        let json_tg = candidate
+            .remove("json_tg")
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        return PackageEntry {
+            table,
+            id,
+            version: normalize_version_string(version),
+            json_ordered: Value::Object(candidate),
+            json_tg: Some(json_tg),
+            model_id: None,
+            rule_verification: true,
+        };
+    }
+
+    PackageEntry {
+        table,
+        id,
+        version: normalize_version_string(version),
+        json_ordered: dataset,
+        json_tg: Some(Value::Object(Map::new())),
+        model_id: None,
+        rule_verification: true,
+    }
+}
+
 fn serialize_entry_dataset(entry: &PackageEntry) -> Value {
     if entry.table != PackageRootTable::Lifecyclemodels {
         return entry.json_ordered.clone();
@@ -2694,6 +2805,59 @@ fn walk_ref_targets(value: &Value, output: &mut Vec<ReferenceTarget>) {
     }
 }
 
+fn parse_root_from_package_file_path(file_path: &str) -> Option<(PackageRootTable, Uuid, String)> {
+    let (table_raw, file_name) = file_path.split_once('/')?;
+    let table = parse_table_name(table_raw)?;
+    let file_stem = file_name.strip_suffix(".json")?;
+    let (id_raw, version_raw) = file_stem.rsplit_once('_')?;
+    let id = parse_uuid_opt(id_raw)?;
+    let version = normalize_version_string(version_raw);
+    if version.is_empty() {
+        return None;
+    }
+    Some((table, id, version))
+}
+
+fn backfill_process_model_ids(mut entries: Vec<PackageEntry>) -> Vec<PackageEntry> {
+    let process_model_ids = entries
+        .iter()
+        .filter(|entry| entry.table == PackageRootTable::Lifecyclemodels)
+        .filter_map(|entry| {
+            entry.json_tg.as_ref().map(|json_tg| {
+                (
+                    entry.id,
+                    extract_model_submodels_from_value(
+                        entry.version.as_str(),
+                        json_tg.get("submodels").unwrap_or(json_tg),
+                    ),
+                )
+            })
+        })
+        .flat_map(|(model_id, refs)| {
+            refs.into_iter().filter_map(move |reference| {
+                (reference.table == PackageRootTable::Processes)
+                    .then(|| {
+                        reference
+                            .version
+                            .map(|version| (table_key(reference.table, reference.id, &version), model_id))
+                    })
+                    .flatten()
+            })
+        })
+        .collect::<HashMap<_, _>>();
+
+    for entry in &mut entries {
+        if entry.table != PackageRootTable::Processes || entry.model_id.is_some() {
+            continue;
+        }
+        entry.model_id = process_model_ids
+            .get(&table_key(entry.table, entry.id, &entry.version))
+            .copied();
+    }
+
+    entries
+}
+
 fn extract_model_submodels(entry: &PackageEntry) -> Vec<ReferenceTarget> {
     if entry.table != PackageRootTable::Lifecyclemodels {
         return Vec::new();
@@ -2722,6 +2886,7 @@ fn extract_model_submodels_from_value(
             let object = item.as_object()?;
             let id = object
                 .get("id")
+                .or_else(|| object.get("processId"))
                 .and_then(Value::as_str)
                 .and_then(parse_uuid_opt)?;
             let version = object
@@ -3648,20 +3813,47 @@ fn parse_conflict_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<ConflictRow
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        io::{Cursor, Write},
+    };
 
-    use serde_json::json;
+    use serde_json::{Value, json};
     use uuid::Uuid;
+    use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
     use super::{
         ConflictRow, ExportTraversalCache, PackageEntry, ReferenceTarget,
-        clear_runtime_export_traversal_cache, extract_model_submodels_from_value,
-        load_runtime_export_traversal_cache, normalize_version_string,
-        partition_conflicts_from_rows, plan_reference_resolution, remember_root_in_traversal_cache,
-        resolve_exact_or_latest_roots, resolve_referenced_entries_from_rows,
-        store_runtime_export_traversal_cache,
+        PackageManifest, PackageManifestEntry, clear_runtime_export_traversal_cache,
+        extract_model_submodels_from_value, load_runtime_export_traversal_cache,
+        normalize_version_string, parse_package_entries, partition_conflicts_from_rows,
+        plan_reference_resolution, remember_root_in_traversal_cache, resolve_exact_or_latest_roots,
+        resolve_referenced_entries_from_rows, store_runtime_export_traversal_cache,
     };
-    use crate::package_types::{PackageRootRef, PackageRootTable};
+    use crate::package_types::{PackageExportScope, PackageRootRef, PackageRootTable};
+
+    fn build_test_package_zip(
+        manifest: Option<Value>,
+        files: &[(&str, Value)],
+    ) -> anyhow::Result<Vec<u8>> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(cursor);
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .compression_level(Some(6));
+
+        if let Some(manifest_value) = manifest {
+            writer.start_file("manifest.json", options)?;
+            writer.write_all(serde_json::to_string_pretty(&manifest_value)?.as_bytes())?;
+        }
+
+        for (path, payload) in files {
+            writer.start_file(*path, options)?;
+            writer.write_all(serde_json::to_string_pretty(payload)?.as_bytes())?;
+        }
+
+        Ok(writer.finish()?.into_inner())
+    }
 
     #[test]
     fn normalize_version_string_pads_numeric_versions() {
@@ -4057,5 +4249,94 @@ mod tests {
 
         clear_runtime_export_traversal_cache(job_id);
         assert!(load_runtime_export_traversal_cache(job_id).is_none());
+    }
+
+    #[test]
+    fn parse_package_entries_accepts_manifest_without_current_version_marker() {
+        let process_id = Uuid::from_u128(12);
+        let model_id = Uuid::from_u128(13);
+        let manifest = json!(PackageManifest {
+            format: "tidas-package".to_owned(),
+            version: 1,
+            exported_at: "2026-03-20T00:00:00Z".to_owned(),
+            scope: PackageExportScope::SelectedRoots,
+            roots: vec![PackageRootRef {
+                table: PackageRootTable::Processes,
+                id: process_id,
+                version: "01.00.000".to_owned(),
+            }],
+            entries: vec![PackageManifestEntry {
+                table: PackageRootTable::Processes,
+                id: process_id,
+                version: "01.00.000".to_owned(),
+                file_path: format!("processes/{process_id}_01.00.000.json"),
+                rule_verification: true,
+                model_id: Some(model_id),
+            }],
+            counts: HashMap::from([("processes".to_owned(), 1_usize)]).into_iter().collect(),
+            total_count: 1,
+        });
+        let zip_bytes = build_test_package_zip(
+            Some(manifest),
+            &[(
+                &format!("processes/{process_id}_01.00.000.json"),
+                json!({
+                    "processInformation": {
+                        "dataSetInformation": { "name": { "baseName": "Legacy manifest process" } }
+                    }
+                }),
+            )],
+        )
+        .expect("build package zip");
+
+        let entries = parse_package_entries(zip_bytes.as_slice()).expect("parse package entries");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].table, PackageRootTable::Processes);
+        assert_eq!(entries[0].id, process_id);
+        assert_eq!(entries[0].version, "01.00.000");
+        assert_eq!(entries[0].model_id, Some(model_id));
+    }
+
+    #[test]
+    fn parse_package_entries_can_infer_entries_without_manifest() {
+        let process_id = Uuid::from_u128(14);
+        let model_id = Uuid::from_u128(15);
+        let zip_bytes = build_test_package_zip(
+            None,
+            &[
+                (
+                    &format!("lifecyclemodels/{model_id}_01.00.000.json"),
+                    json!({
+                        "name": "Model without manifest",
+                        "json_tg": {
+                            "submodels": [
+                                { "processId": process_id, "version": "01.00.000" }
+                            ]
+                        }
+                    }),
+                ),
+                (
+                    &format!("processes/{process_id}_01.00.000.json"),
+                    json!({
+                        "processInformation": {
+                            "dataSetInformation": { "name": { "baseName": "Process without manifest" } }
+                        }
+                    }),
+                ),
+            ],
+        )
+        .expect("build package zip");
+
+        let entries = parse_package_entries(zip_bytes.as_slice()).expect("parse package entries");
+        assert_eq!(entries.len(), 2);
+
+        let process_entry = entries
+            .iter()
+            .find(|entry| entry.table == PackageRootTable::Processes)
+            .expect("process entry should exist");
+        assert_eq!(process_entry.id, process_id);
+        assert_eq!(process_entry.version, "01.00.000");
+        assert_eq!(process_entry.model_id, Some(model_id));
     }
 }
