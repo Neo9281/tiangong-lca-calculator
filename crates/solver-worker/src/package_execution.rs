@@ -2013,8 +2013,11 @@ async fn insert_entries(
 
     for table in INSERT_ORDER {
         for entry in entries.iter().filter(|entry| entry.table == table) {
-            let normalized_json_ordered =
-                normalize_json_ordered_for_insert(table, &entry.version, entry.json_ordered.clone());
+            let normalized_json_ordered = normalize_json_ordered_for_insert(
+                table,
+                &entry.version,
+                entry.json_ordered.clone(),
+            );
             match table {
                 PackageRootTable::Contacts => {
                     sqlx::query(
@@ -2909,9 +2912,9 @@ fn backfill_process_model_ids(mut entries: Vec<PackageEntry>) -> Vec<PackageEntr
             refs.into_iter().filter_map(move |reference| {
                 (reference.table == PackageRootTable::Processes)
                     .then(|| {
-                        reference
-                            .version
-                            .map(|version| (table_key(reference.table, reference.id, &version), model_id))
+                        reference.version.map(|version| {
+                            (table_key(reference.table, reference.id, &version), model_id)
+                        })
                     })
                     .flatten()
             })
@@ -3895,12 +3898,11 @@ mod tests {
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
     use super::{
-        ConflictRow, ExportTraversalCache, PackageEntry, ReferenceTarget,
-        PackageManifest, PackageManifestEntry, clear_runtime_export_traversal_cache,
-        extract_model_submodels_from_value, load_runtime_export_traversal_cache,
-        normalize_json_ordered_for_insert, normalize_version_string, parse_package_entries,
-        partition_conflicts_from_rows, plan_reference_resolution,
-        remember_root_in_traversal_cache, resolve_exact_or_latest_roots,
+        ConflictRow, ExportTraversalCache, PackageEntry, PackageManifest, PackageManifestEntry,
+        ReferenceTarget, clear_runtime_export_traversal_cache, extract_model_submodels_from_value,
+        load_runtime_export_traversal_cache, normalize_json_ordered_for_insert,
+        normalize_version_string, parse_package_entries, partition_conflicts_from_rows,
+        plan_reference_resolution, remember_root_in_traversal_cache, resolve_exact_or_latest_roots,
         resolve_referenced_entries_from_rows, store_runtime_export_traversal_cache,
     };
     use crate::package_types::{PackageExportScope, PackageRootRef, PackageRootTable};
@@ -4346,7 +4348,9 @@ mod tests {
                 rule_verification: true,
                 model_id: Some(model_id),
             }],
-            counts: HashMap::from([("processes".to_owned(), 1_usize)]).into_iter().collect(),
+            counts: HashMap::from([("processes".to_owned(), 1_usize)])
+                .into_iter()
+                .collect(),
             total_count: 1,
         });
         let zip_bytes = build_test_package_zip(
@@ -4426,8 +4430,8 @@ mod tests {
         );
 
         assert_eq!(
-            normalized["lifeCycleModelDataSet"]["administrativeInformation"]
-                ["publicationAndOwnership"]["common:dataSetVersion"],
+            normalized["lifeCycleModelDataSet"]["administrativeInformation"]["publicationAndOwnership"]
+                ["common:dataSetVersion"],
             json!("01.00.000")
         );
         assert_eq!(
