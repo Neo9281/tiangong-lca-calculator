@@ -265,6 +265,83 @@ pub async fn enqueue_package_job_payload(
     Ok(row.try_get::<i64, _>("msg_id")?)
 }
 
+/// Returns whether one package job error is likely transient and worth retrying.
+#[must_use]
+pub fn is_retryable_package_job_error(err: &anyhow::Error) -> bool {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .is_some_and(is_retryable_sqlx_error)
+    }) {
+        return true;
+    }
+
+    let lowered = err.to_string().to_ascii_lowercase();
+    lowered.contains("pool timed out while waiting for an open connection")
+        || (lowered.contains("error communicating with database")
+            && (lowered.contains("at eof")
+                || lowered.contains("connection reset by peer")
+                || lowered.contains("broken pipe")
+                || lowered.contains("connection closed")
+                || lowered.contains("unexpected eof")))
+}
+
+/// Re-enqueues one package payload after incrementing the retry attempt, if budget remains.
+#[instrument(skip(pool, payload))]
+pub async fn reschedule_retryable_package_job(
+    pool: &PgPool,
+    payload: &PackageJobPayload,
+    error_message: &str,
+) -> anyhow::Result<bool> {
+    let job_id = extract_package_job_id(payload);
+    let mut tx = pool.begin().await?;
+    let retry_row = sqlx::query(
+        r"
+        UPDATE lca_package_jobs
+        SET attempt = attempt + 1,
+            status = 'queued',
+            diagnostics = COALESCE(diagnostics, '{}'::jsonb) || jsonb_build_object(
+                'message', 'Retrying after transient database error',
+                'last_retryable_error', $2,
+                'retry_count', attempt + 1,
+                'max_attempt', max_attempt,
+                'retry_scheduled', TRUE
+            ),
+            updated_at = NOW()
+        WHERE id = $1
+          AND attempt < max_attempt
+        RETURNING attempt, max_attempt
+        ",
+    )
+    .bind(job_id)
+    .bind(error_message)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(row) = retry_row else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+
+    let _ = sqlx::query("SELECT pgmq.send($1, $2::jsonb) AS msg_id")
+        .bind(PACKAGE_QUEUE_NAME)
+        .bind(serde_json::to_value(payload)?)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    warn!(
+        job_id = %job_id,
+        attempt = row.try_get::<i32, _>("attempt").unwrap_or_default(),
+        max_attempt = row.try_get::<i32, _>("max_attempt").unwrap_or_default(),
+        error = error_message,
+        "rescheduled package job after retryable database error"
+    );
+
+    Ok(true)
+}
+
 /// Executes one package queue payload end-to-end.
 #[instrument(skip(state))]
 #[allow(clippy::too_many_lines)]
@@ -444,14 +521,33 @@ fn is_undefined_table(err: &sqlx::Error) -> bool {
     }
 }
 
+fn is_retryable_sqlx_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Io(io_err) => matches!(
+            io_err.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::Protocol(_) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
     use serde_json::json;
     use uuid::Uuid;
 
     use super::{
         extract_package_job_id, extract_package_job_id_from_raw_payload,
-        merge_package_job_status_update_timing,
+        is_retryable_package_job_error, merge_package_job_status_update_timing,
     };
     use crate::package_types::{PackageExportScope, PackageJobPayload};
 
@@ -499,5 +595,19 @@ mod tests {
             merged["job_status_update_timing_sec"]["last_db_write_sec"],
             0.125
         );
+    }
+
+    #[test]
+    fn retryable_package_error_matches_sqlx_pool_timeout() {
+        let err = anyhow::Error::new(sqlx::Error::PoolTimedOut);
+        assert!(is_retryable_package_job_error(&err));
+    }
+
+    #[test]
+    fn retryable_package_error_matches_eof_message() {
+        let err = anyhow!(
+            "error communicating with database: expected to read 9784 bytes, got 6812 bytes at EOF"
+        );
+        assert!(is_retryable_package_job_error(&err));
     }
 }

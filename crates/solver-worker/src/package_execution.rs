@@ -592,7 +592,7 @@ fn store_runtime_export_traversal_cache(job_id: Uuid, cache: &ExportTraversalCac
     let _ = guard.insert(job_id, cache.clone());
 }
 
-pub(crate) fn clear_runtime_export_traversal_cache(job_id: Uuid) {
+pub fn clear_runtime_export_traversal_cache(job_id: Uuid) {
     let mut guard = EXPORT_TRAVERSAL_RUNTIME_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

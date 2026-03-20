@@ -7,8 +7,11 @@ use solver_worker::{
     db::{AppState, archive_queue_message, read_one_queue_message},
     package_db::{
         extract_package_job_id, extract_package_job_id_from_raw_payload,
-        handle_package_job_payload, mark_package_request_cache_failed, update_package_job_status,
+        handle_package_job_payload, is_retryable_package_job_error,
+        mark_package_request_cache_failed, reschedule_retryable_package_job,
+        update_package_job_status,
     },
+    package_execution::clear_runtime_export_traversal_cache,
     package_types::{PACKAGE_QUEUE_NAME, PackageJobPayload},
 };
 use tokio::time::sleep;
@@ -48,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[instrument(skip(state))]
+#[allow(clippy::too_many_lines)]
 async fn run_package_worker_loop(
     state: Arc<AppState>,
     queue_name: String,
@@ -65,20 +69,52 @@ async fn run_package_worker_loop(
                             error!(error = %err, "package job execution failed");
                             let job_id = extract_package_job_id(&payload);
                             let err_message = err.to_string();
-                            let _ = update_package_job_status(
-                                &state.pool,
-                                job_id,
-                                "failed",
-                                json!({"error": err_message}),
-                            )
-                            .await;
-                            let _ = mark_package_request_cache_failed(
-                                &state.pool,
-                                job_id,
-                                "job_execution_failed",
-                                &err_message,
-                            )
-                            .await;
+                            let mut rescheduled = false;
+                            clear_runtime_export_traversal_cache(job_id);
+                            if is_retryable_package_job_error(&err) {
+                                match reschedule_retryable_package_job(
+                                    &state.pool,
+                                    &payload,
+                                    &err_message,
+                                )
+                                .await
+                                {
+                                    Ok(true) => {
+                                        rescheduled = true;
+                                    }
+                                    Ok(false) => {
+                                        warn!(
+                                            job_id = %job_id,
+                                            error = %err_message,
+                                            "package job retry budget exhausted"
+                                        );
+                                    }
+                                    Err(retry_err) => {
+                                        warn!(
+                                            job_id = %job_id,
+                                            error = %retry_err,
+                                            original_error = %err_message,
+                                            "failed to reschedule retryable package job"
+                                        );
+                                    }
+                                }
+                            }
+                            if !rescheduled {
+                                let _ = update_package_job_status(
+                                    &state.pool,
+                                    job_id,
+                                    "failed",
+                                    json!({"error": err_message}),
+                                )
+                                .await;
+                                let _ = mark_package_request_cache_failed(
+                                    &state.pool,
+                                    job_id,
+                                    "job_execution_failed",
+                                    &err_message,
+                                )
+                                .await;
+                            }
                         } else {
                             info!("package job completed");
                         }
