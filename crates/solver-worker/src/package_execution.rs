@@ -2013,6 +2013,8 @@ async fn insert_entries(
 
     for table in INSERT_ORDER {
         for entry in entries.iter().filter(|entry| entry.table == table) {
+            let normalized_json_ordered =
+                normalize_json_ordered_for_insert(table, &entry.version, entry.json_ordered.clone());
             match table {
                 PackageRootTable::Contacts => {
                     sqlx::query(
@@ -2023,7 +2025,7 @@ async fn insert_entries(
                     )
                     .bind(entry.id)
                     .bind(entry.version.clone())
-                    .bind(entry.json_ordered.clone())
+                    .bind(normalized_json_ordered)
                     .bind(entry.rule_verification)
                     .bind(requested_by)
                     .execute(&mut *tx)
@@ -2038,7 +2040,7 @@ async fn insert_entries(
                     )
                     .bind(entry.id)
                     .bind(entry.version.clone())
-                    .bind(entry.json_ordered.clone())
+                    .bind(normalized_json_ordered)
                     .bind(entry.rule_verification)
                     .bind(requested_by)
                     .execute(&mut *tx)
@@ -2053,7 +2055,7 @@ async fn insert_entries(
                     )
                     .bind(entry.id)
                     .bind(entry.version.clone())
-                    .bind(entry.json_ordered.clone())
+                    .bind(normalized_json_ordered)
                     .bind(entry.rule_verification)
                     .bind(requested_by)
                     .execute(&mut *tx)
@@ -2068,7 +2070,7 @@ async fn insert_entries(
                     )
                     .bind(entry.id)
                     .bind(entry.version.clone())
-                    .bind(entry.json_ordered.clone())
+                    .bind(normalized_json_ordered)
                     .bind(entry.rule_verification)
                     .bind(requested_by)
                     .execute(&mut *tx)
@@ -2083,7 +2085,7 @@ async fn insert_entries(
                     )
                     .bind(entry.id)
                     .bind(entry.version.clone())
-                    .bind(entry.json_ordered.clone())
+                    .bind(normalized_json_ordered)
                     .bind(entry.rule_verification)
                     .bind(requested_by)
                     .execute(&mut *tx)
@@ -2098,7 +2100,7 @@ async fn insert_entries(
                     )
                     .bind(entry.id)
                     .bind(entry.version.clone())
-                    .bind(entry.json_ordered.clone())
+                    .bind(normalized_json_ordered)
                     .bind(entry.rule_verification)
                     .bind(entry.json_tg.clone().unwrap_or_else(|| json!({})))
                     .bind(requested_by)
@@ -2114,7 +2116,7 @@ async fn insert_entries(
                     )
                     .bind(entry.id)
                     .bind(entry.version.clone())
-                    .bind(entry.json_ordered.clone())
+                    .bind(normalized_json_ordered)
                     .bind(entry.rule_verification)
                     .bind(entry.model_id)
                     .bind(requested_by)
@@ -2764,6 +2766,76 @@ fn serialize_entry_dataset(entry: &PackageEntry) -> Value {
         "json_ordered": entry.json_ordered,
         "json_tg": entry.json_tg.clone().unwrap_or_else(|| Value::Object(Map::new())),
     })
+}
+
+fn normalize_json_ordered_for_insert(
+    table: PackageRootTable,
+    version: &str,
+    dataset: Value,
+) -> Value {
+    let root_key = dataset_root_key(table);
+    let mut outer = match dataset {
+        Value::Object(map) => map,
+        other => {
+            let mut root = Map::new();
+            root.insert(root_key.to_owned(), other);
+            return ensure_dataset_version_path(Value::Object(root), root_key, version);
+        }
+    };
+
+    if !outer.contains_key(root_key) {
+        let inner = std::mem::take(&mut outer);
+        outer.insert(root_key.to_owned(), Value::Object(inner));
+    }
+
+    ensure_dataset_version_path(Value::Object(outer), root_key, version)
+}
+
+fn ensure_dataset_version_path(dataset: Value, root_key: &str, version: &str) -> Value {
+    let Value::Object(mut outer) = dataset else {
+        return dataset;
+    };
+
+    let mut root_object = outer
+        .remove(root_key)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+
+    let mut administrative = root_object
+        .remove("administrativeInformation")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut publication = administrative
+        .remove("publicationAndOwnership")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    publication.insert(
+        "common:dataSetVersion".to_owned(),
+        Value::String(normalize_version_string(version)),
+    );
+    administrative.insert(
+        "publicationAndOwnership".to_owned(),
+        Value::Object(publication),
+    );
+    root_object.insert(
+        "administrativeInformation".to_owned(),
+        Value::Object(administrative),
+    );
+    outer.insert(root_key.to_owned(), Value::Object(root_object));
+
+    Value::Object(outer)
+}
+
+fn dataset_root_key(table: PackageRootTable) -> &'static str {
+    match table {
+        PackageRootTable::Contacts => "contactDataSet",
+        PackageRootTable::Sources => "sourceDataSet",
+        PackageRootTable::Unitgroups => "unitGroupDataSet",
+        PackageRootTable::Flowproperties => "flowPropertyDataSet",
+        PackageRootTable::Flows => "flowDataSet",
+        PackageRootTable::Processes => "processDataSet",
+        PackageRootTable::Lifecyclemodels => "lifeCycleModelDataSet",
+    }
 }
 
 fn extract_ref_targets(source: &Value) -> Vec<ReferenceTarget> {
@@ -3826,8 +3898,9 @@ mod tests {
         ConflictRow, ExportTraversalCache, PackageEntry, ReferenceTarget,
         PackageManifest, PackageManifestEntry, clear_runtime_export_traversal_cache,
         extract_model_submodels_from_value, load_runtime_export_traversal_cache,
-        normalize_version_string, parse_package_entries, partition_conflicts_from_rows,
-        plan_reference_resolution, remember_root_in_traversal_cache, resolve_exact_or_latest_roots,
+        normalize_json_ordered_for_insert, normalize_version_string, parse_package_entries,
+        partition_conflicts_from_rows, plan_reference_resolution,
+        remember_root_in_traversal_cache, resolve_exact_or_latest_roots,
         resolve_referenced_entries_from_rows, store_runtime_export_traversal_cache,
     };
     use crate::package_types::{PackageExportScope, PackageRootRef, PackageRootTable};
@@ -4338,5 +4411,28 @@ mod tests {
         assert_eq!(process_entry.id, process_id);
         assert_eq!(process_entry.version, "01.00.000");
         assert_eq!(process_entry.model_id, Some(model_id));
+    }
+
+    #[test]
+    fn normalize_json_ordered_for_insert_wraps_bare_lifecyclemodel_payload() {
+        let payload = json!({
+            "name": "Bare lifecycle model"
+        });
+
+        let normalized = normalize_json_ordered_for_insert(
+            PackageRootTable::Lifecyclemodels,
+            "01.00.000",
+            payload,
+        );
+
+        assert_eq!(
+            normalized["lifeCycleModelDataSet"]["administrativeInformation"]
+                ["publicationAndOwnership"]["common:dataSetVersion"],
+            json!("01.00.000")
+        );
+        assert_eq!(
+            normalized["lifeCycleModelDataSet"]["name"],
+            json!("Bare lifecycle model")
+        );
     }
 }
