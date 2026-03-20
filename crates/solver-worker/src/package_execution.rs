@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{Cursor, Read, Seek, Write},
+    sync::{LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -34,6 +35,7 @@ const IMPORT_REPORT_SUFFIX: &str = "import-report";
 const EXPORT_REF_BATCH_SIZE: i64 = 96;
 const EXPORT_SEED_SCAN_BATCH_SIZE: i64 = 256;
 const EXPORT_FINALIZE_FETCH_BATCH_SIZE: usize = 256;
+const EXPORT_ITEM_INSERT_CHUNK_SIZE: usize = 500;
 const EXPORT_BATCHES_PER_PASS: usize = 6;
 const EXPORT_PASS_TIME_BUDGET: Duration = Duration::from_secs(20);
 
@@ -181,16 +183,30 @@ struct PackageExportItem {
 }
 
 #[derive(Debug, Clone)]
+struct PackageSeedScanEntry {
+    table: PackageRootTable,
+    id: Uuid,
+    version: String,
+    ref_candidates: Value,
+    submodels: Value,
+    model_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
 struct ExportBatchResult {
     processed_count: usize,
     discovered_count: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct ExportTraversalCache {
     known_exact: HashSet<String>,
+    known_any_version: HashSet<(PackageRootTable, Uuid)>,
     resolved_latest: HashMap<(PackageRootTable, Uuid), Option<String>>,
 }
+
+static EXPORT_TRAVERSAL_RUNTIME_CACHE: LazyLock<Mutex<HashMap<Uuid, ExportTraversalCache>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Default)]
 struct PlannedReferenceResolution {
@@ -221,6 +237,7 @@ struct ExportSeedScanResult {
     pass_discovered_count: usize,
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn execute_export_package(
     state: &AppState,
     job_id: Uuid,
@@ -242,7 +259,7 @@ pub async fn execute_export_package(
         mark_seed_export_items_refs_done(&state.pool, job_id).await?;
     }
 
-    let mut traversal_cache = load_export_traversal_cache(&state.pool, job_id).await?;
+    let mut traversal_cache = load_export_traversal_cache(&state.pool, job_id, scope).await?;
     let mut seed_scan_complete = !full_scope_export;
     let mut seed_scan_scanned_in_pass = 0usize;
     let mut seed_scan_discovered_in_pass = 0usize;
@@ -263,6 +280,7 @@ pub async fn execute_export_package(
             .await?;
             seed_scan_scanned_in_pass = seed_scan_result.pass_scanned_count;
             seed_scan_discovered_in_pass = seed_scan_result.pass_discovered_count;
+            store_runtime_export_traversal_cache(job_id, &traversal_cache);
             if !seed_scan_result.state.complete {
                 let total_items = count_export_items(&state.pool, job_id).await?;
                 let pending_after = count_pending_export_items(&state.pool, job_id).await?;
@@ -295,9 +313,10 @@ pub async fn execute_export_package(
     let mut batches_processed = 0usize;
     let mut processed_in_pass = 0usize;
     let mut discovered_in_pass = 0usize;
+    let collect_pass_started = Instant::now();
 
     while batches_processed < EXPORT_BATCHES_PER_PASS
-        && pass_started.elapsed() < EXPORT_PASS_TIME_BUDGET
+        && collect_pass_started.elapsed() < EXPORT_PASS_TIME_BUDGET
     {
         let batch = fetch_pending_export_items(&state.pool, job_id, EXPORT_REF_BATCH_SIZE).await?;
         if batch.is_empty() {
@@ -317,10 +336,31 @@ pub async fn execute_export_package(
     let processed_items = total_items.saturating_sub(pending_after);
 
     if pending_after > 0 {
+        store_runtime_export_traversal_cache(job_id, &traversal_cache);
         if processed_in_pass == 0 && seed_scan_scanned_in_pass == 0 {
-            return Err(anyhow::anyhow!(
-                "package export item state is inconsistent for job {job_id}"
-            ));
+            return Ok(PackageExecutionOutcome {
+                final_status: "running",
+                diagnostics: export_progress_diagnostics(
+                    "collect_refs",
+                    scope,
+                    root_count,
+                    total_items,
+                    processed_items,
+                    pending_after,
+                    json!({
+                        "batch_processed_count": 0,
+                        "batch_discovered_count": 0,
+                        "batches_processed": 0,
+                        "message": "Waiting to resume related dataset collection",
+                        "seed_scan_complete": seed_scan_complete,
+                        "seed_scan_batch_processed_count": seed_scan_scanned_in_pass,
+                        "seed_scan_batch_discovered_count": seed_scan_discovered_in_pass,
+                        "idle_pass": true,
+                    }),
+                ),
+                export_artifact_id: None,
+                report_artifact_id: None,
+            });
         }
 
         return Ok(PackageExecutionOutcome {
@@ -423,6 +463,7 @@ pub async fn execute_export_package(
     )
     .await?;
 
+    clear_runtime_export_traversal_cache(job_id);
     Ok(PackageExecutionOutcome {
         final_status: "ready",
         diagnostics: json!({
@@ -458,11 +499,13 @@ async fn ensure_export_seed_items(
         return Ok(usize::try_from(root_count).unwrap_or_default());
     }
 
-    let seed_roots = if !roots.is_empty() {
-        let existing_entries = fetch_rows_by_exact_roots(pool, roots).await?;
-        let fetched_keys = existing_entries
+    let seed_roots = if roots.is_empty() {
+        fetch_scope_root_refs(pool, requested_by, scope).await?
+    } else {
+        let existing_roots = fetch_root_refs_by_exact_roots(pool, roots).await?;
+        let fetched_keys = existing_roots
             .iter()
-            .map(|entry| table_key(entry.table, entry.id, &entry.version))
+            .map(|root| table_key(root.table, root.id, &root.version))
             .collect::<HashSet<_>>();
         let missing_roots = roots
             .iter()
@@ -474,16 +517,7 @@ async fn ensure_export_seed_items(
             ));
         }
 
-        existing_entries
-            .into_iter()
-            .map(|entry| PackageRootRef {
-                table: entry.table,
-                id: entry.id,
-                version: entry.version,
-            })
-            .collect::<Vec<_>>()
-    } else {
-        fetch_scope_root_refs(pool, requested_by, scope).await?
+        existing_roots
     };
 
     let seed_refs_done = !matches!(scope, PackageExportScope::SelectedRoots);
@@ -500,16 +534,69 @@ async fn ensure_export_seed_items(
 async fn load_export_traversal_cache(
     pool: &PgPool,
     job_id: Uuid,
+    scope: PackageExportScope,
 ) -> anyhow::Result<ExportTraversalCache> {
-    let items = list_export_items(pool, job_id).await?;
-    let known_exact = items
-        .iter()
-        .map(|item| table_key(item.table, item.id, &item.version))
-        .collect::<HashSet<_>>();
-    Ok(ExportTraversalCache {
-        known_exact,
-        resolved_latest: HashMap::new(),
-    })
+    if let Some(cache) = load_runtime_export_traversal_cache(job_id) {
+        return Ok(cache);
+    }
+
+    let mut cache = ExportTraversalCache::default();
+
+    if matches!(scope, PackageExportScope::SelectedRoots) {
+        let items = list_export_items(pool, job_id).await?;
+        for item in items {
+            remember_root_in_traversal_cache(
+                &mut cache,
+                &PackageRootRef {
+                    table: item.table,
+                    id: item.id,
+                    version: item.version,
+                },
+            );
+        }
+        return Ok(cache);
+    }
+
+    let seed_items = list_seed_export_items_for_cache(pool, job_id).await?;
+    for root in seed_items {
+        remember_root_in_traversal_cache(&mut cache, &root);
+    }
+
+    let external_items = list_non_seed_export_items(pool, job_id).await?;
+    for item in external_items {
+        remember_root_in_traversal_cache(
+            &mut cache,
+            &PackageRootRef {
+                table: item.table,
+                id: item.id,
+                version: item.version,
+            },
+        );
+    }
+
+    store_runtime_export_traversal_cache(job_id, &cache);
+    Ok(cache)
+}
+
+fn load_runtime_export_traversal_cache(job_id: Uuid) -> Option<ExportTraversalCache> {
+    let guard = EXPORT_TRAVERSAL_RUNTIME_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.get(&job_id).cloned()
+}
+
+fn store_runtime_export_traversal_cache(job_id: Uuid, cache: &ExportTraversalCache) {
+    let mut guard = EXPORT_TRAVERSAL_RUNTIME_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = guard.insert(job_id, cache.clone());
+}
+
+pub(crate) fn clear_runtime_export_traversal_cache(job_id: Uuid) {
+    let mut guard = EXPORT_TRAVERSAL_RUNTIME_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = guard.remove(&job_id);
 }
 
 async fn fetch_package_job_diagnostics(pool: &PgPool, job_id: Uuid) -> anyhow::Result<Value> {
@@ -732,6 +819,7 @@ fn scope_root_refs_by_open_data_sql(table: PackageRootTable) -> String {
     )
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn parse_root_ref_row(
     table: PackageRootTable,
     row: &sqlx::postgres::PgRow,
@@ -755,7 +843,7 @@ fn parse_root_ref_row(
     Ok(Some(PackageRootRef { table, id, version }))
 }
 
-async fn fetch_scope_entries_batch_after_cursor(
+async fn fetch_scope_seed_scan_batch_after_cursor(
     pool: &PgPool,
     requested_by: Uuid,
     scope: PackageExportScope,
@@ -763,8 +851,8 @@ async fn fetch_scope_entries_batch_after_cursor(
     after_id: Option<Uuid>,
     after_version: Option<&str>,
     limit: i64,
-) -> anyhow::Result<Vec<PackageEntry>> {
-    let mut builder = QueryBuilder::<Postgres>::new(scope_select_prefix_sql(table));
+) -> anyhow::Result<Vec<PackageSeedScanEntry>> {
+    let mut builder = QueryBuilder::<Postgres>::new(scope_seed_scan_select_prefix_sql(table));
     builder.push(" WHERE ");
     match scope {
         PackageExportScope::CurrentUser => {
@@ -806,7 +894,7 @@ async fn fetch_scope_entries_batch_after_cursor(
     let rows = builder.build().fetch_all(pool).await?;
 
     rows.iter()
-        .map(|row| parse_package_entry_row(table, row))
+        .map(|row| parse_seed_scan_entry_row(table, row))
         .collect::<anyhow::Result<Vec<_>>>()
         .map(|entries| entries.into_iter().flatten().collect())
 }
@@ -834,9 +922,8 @@ async fn insert_export_items(
         );
     }
 
-    const CHUNK_SIZE: usize = 500;
     let items = deduped.into_values().collect::<Vec<_>>();
-    for chunk in items.chunks(CHUNK_SIZE) {
+    for chunk in items.chunks(EXPORT_ITEM_INSERT_CHUNK_SIZE) {
         let mut builder = QueryBuilder::<Postgres>::new(
             "INSERT INTO lca_package_export_items (job_id, table_name, dataset_id, version, is_seed, refs_done) ",
         );
@@ -914,51 +1001,46 @@ async fn process_export_item_batch(
             version: item.version.clone(),
         })
         .collect::<Vec<_>>();
-    let rows = fetch_rows_by_exact_roots(pool, roots.as_slice()).await?;
+    let rows = fetch_reference_scan_rows_by_exact_roots(pool, roots.as_slice()).await?;
     let selected_roots_export = matches!(scope, PackageExportScope::SelectedRoots);
     let mut refs = Vec::new();
     let mut discovered = BTreeMap::<String, PackageRootRef>::new();
 
     for current in &rows {
-        refs.extend(extract_ref_targets(&current.json_ordered));
+        refs.extend(extract_ref_targets(&current.ref_candidates));
 
         if selected_roots_export && current.table == PackageRootTable::Lifecyclemodels {
             let related_processes =
-                fetch_model_processes(pool, current.id, &current.version).await?;
-            for entry in related_processes {
-                push_discovered_root(
-                    &mut discovered,
-                    cache,
-                    PackageRootRef {
-                        table: entry.table,
-                        id: entry.id,
-                        version: entry.version,
-                    },
-                );
+                fetch_model_process_roots(pool, current.id, &current.version).await?;
+            for root in related_processes {
+                push_discovered_root(&mut discovered, cache, root);
             }
-            refs.extend(extract_model_submodels(current));
+            refs.extend(extract_model_submodels_from_value(
+                &current.version,
+                &current.submodels,
+            ));
         }
 
         if selected_roots_export
             && current.table == PackageRootTable::Processes
             && let Some(model_id) = current.model_id
         {
-            let related_models = fetch_process_model(pool, model_id, &current.version).await?;
-            for entry in related_models {
-                push_discovered_root(
-                    &mut discovered,
-                    cache,
-                    PackageRootRef {
-                        table: entry.table,
-                        id: entry.id,
-                        version: entry.version,
-                    },
-                );
+            let related_models =
+                fetch_process_model_roots(pool, model_id, &current.version).await?;
+            for root in related_models {
+                push_discovered_root(&mut discovered, cache, root);
             }
         }
     }
 
-    resolve_discovered_roots_from_refs(pool, refs.as_slice(), cache, &mut discovered).await?;
+    resolve_discovered_roots_from_refs(
+        pool,
+        refs.as_slice(),
+        cache,
+        &mut discovered,
+        !selected_roots_export,
+    )
+    .await?;
 
     let discovered_roots = discovered.into_values().collect::<Vec<_>>();
     insert_export_items(pool, job_id, discovered_roots.as_slice(), false, false).await?;
@@ -975,25 +1057,24 @@ async fn resolve_discovered_roots_from_refs(
     refs: &[ReferenceTarget],
     cache: &mut ExportTraversalCache,
     discovered: &mut BTreeMap<String, PackageRootRef>,
+    skip_covered_versionless_refs: bool,
 ) -> anyhow::Result<()> {
-    let plan = plan_reference_resolution(refs, &cache.known_exact, &cache.resolved_latest);
+    let plan = plan_reference_resolution(
+        refs,
+        &cache.known_exact,
+        &cache.known_any_version,
+        &cache.resolved_latest,
+        skip_covered_versionless_refs,
+    );
     for root in plan.cached_roots {
         push_discovered_root(discovered, cache, root);
     }
 
     if !plan.exact_roots_to_fetch.is_empty() {
-        let exact_entries =
-            fetch_rows_by_exact_roots(pool, plan.exact_roots_to_fetch.as_slice()).await?;
-        for entry in exact_entries {
-            push_discovered_root(
-                discovered,
-                cache,
-                PackageRootRef {
-                    table: entry.table,
-                    id: entry.id,
-                    version: entry.version,
-                },
-            );
+        let exact_roots =
+            fetch_root_refs_by_exact_roots(pool, plan.exact_roots_to_fetch.as_slice()).await?;
+        for root in exact_roots {
+            push_discovered_root(discovered, cache, root);
         }
     }
 
@@ -1011,6 +1092,52 @@ async fn resolve_discovered_roots_from_refs(
                 cache.resolved_latest.insert(cache_key, None);
             }
         }
+    }
+
+    Ok(())
+}
+
+async fn resolve_process_model_roots_from_seed_entries(
+    pool: &PgPool,
+    entries: &[PackageSeedScanEntry],
+    cache: &mut ExportTraversalCache,
+    discovered: &mut BTreeMap<String, PackageRootRef>,
+) -> anyhow::Result<()> {
+    let requested = entries
+        .iter()
+        .filter_map(|entry| {
+            (entry.table == PackageRootTable::Processes)
+                .then_some(
+                    entry
+                        .model_id
+                        .map(|model_id| (model_id, entry.version.clone())),
+                )
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return Ok(());
+    }
+
+    let ids = requested.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let rows = sqlx::query(&select_root_refs_by_ids_sql(
+        PackageRootTable::Lifecyclemodels,
+    ))
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    let parsed = rows
+        .iter()
+        .map(|row| parse_root_ref_row(PackageRootTable::Lifecyclemodels, row))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    for root in
+        resolve_exact_or_latest_roots(PackageRootTable::Lifecyclemodels, &requested, &parsed)
+    {
+        push_discovered_root(discovered, cache, root);
     }
 
     Ok(())
@@ -1034,7 +1161,7 @@ async fn process_seed_scan_pass(
             break;
         };
 
-        let entries = fetch_scope_entries_batch_after_cursor(
+        let entries = fetch_scope_seed_scan_batch_after_cursor(
             pool,
             requested_by,
             scope,
@@ -1055,9 +1182,21 @@ async fn process_seed_scan_pass(
         let mut discovered = BTreeMap::<String, PackageRootRef>::new();
         let mut refs = Vec::new();
         for entry in &entries {
-            refs.extend(extract_ref_targets(&entry.json_ordered));
+            refs.extend(extract_ref_targets(&entry.ref_candidates));
+            refs.extend(extract_model_submodels_from_value(
+                &entry.version,
+                &entry.submodels,
+            ));
         }
-        resolve_discovered_roots_from_refs(pool, refs.as_slice(), cache, &mut discovered).await?;
+        resolve_process_model_roots_from_seed_entries(
+            pool,
+            entries.as_slice(),
+            cache,
+            &mut discovered,
+        )
+        .await?;
+        resolve_discovered_roots_from_refs(pool, refs.as_slice(), cache, &mut discovered, true)
+            .await?;
 
         let discovered_roots = discovered.into_values().collect::<Vec<_>>();
         insert_export_items(pool, job_id, discovered_roots.as_slice(), false, false).await?;
@@ -1099,54 +1238,64 @@ fn push_discovered_root(
 ) {
     let key = table_key(root.table, root.id, &root.version);
     if cache.known_exact.insert(key.clone()) {
+        cache.known_any_version.insert((root.table, root.id));
         discovered.insert(key, root);
     }
+}
+
+fn remember_root_in_traversal_cache(cache: &mut ExportTraversalCache, root: &PackageRootRef) {
+    cache
+        .known_exact
+        .insert(table_key(root.table, root.id, &root.version));
+    cache.known_any_version.insert((root.table, root.id));
 }
 
 fn plan_reference_resolution(
     refs: &[ReferenceTarget],
     known_exact: &HashSet<String>,
+    known_any_version: &HashSet<(PackageRootTable, Uuid)>,
     resolved_latest: &HashMap<(PackageRootTable, Uuid), Option<String>>,
+    skip_covered_versionless_refs: bool,
 ) -> PlannedReferenceResolution {
     let mut cached_roots = BTreeMap::<String, PackageRootRef>::new();
     let mut exact_roots_to_fetch = BTreeMap::<String, PackageRootRef>::new();
     let mut latest_refs_to_fetch = BTreeMap::<(PackageRootTable, Uuid), ReferenceTarget>::new();
 
     for reference in refs {
-        match &reference.version {
-            Some(version) => {
-                let normalized_version = normalize_version_string(version);
-                let root = PackageRootRef {
-                    table: reference.table,
-                    id: reference.id,
-                    version: normalized_version.clone(),
-                };
-                let key = table_key(root.table, root.id, &root.version);
-                if !known_exact.contains(&key) {
-                    exact_roots_to_fetch.insert(key, root);
-                }
+        if let Some(version) = &reference.version {
+            let normalized_version = normalize_version_string(version);
+            let root = PackageRootRef {
+                table: reference.table,
+                id: reference.id,
+                version: normalized_version.clone(),
+            };
+            let key = table_key(root.table, root.id, &root.version);
+            if !known_exact.contains(&key) {
+                exact_roots_to_fetch.insert(key, root);
             }
-            None => {
-                let cache_key = (reference.table, reference.id);
-                if let Some(cached_version) = resolved_latest.get(&cache_key) {
-                    if let Some(version) = cached_version {
-                        let root = PackageRootRef {
-                            table: reference.table,
-                            id: reference.id,
-                            version: version.clone(),
-                        };
-                        let key = table_key(root.table, root.id, &root.version);
-                        if !known_exact.contains(&key) {
-                            cached_roots.insert(key, root);
-                        }
+        } else {
+            let cache_key = (reference.table, reference.id);
+            if skip_covered_versionless_refs && known_any_version.contains(&cache_key) {
+                continue;
+            }
+            if let Some(cached_version) = resolved_latest.get(&cache_key) {
+                if let Some(version) = cached_version {
+                    let root = PackageRootRef {
+                        table: reference.table,
+                        id: reference.id,
+                        version: version.clone(),
+                    };
+                    let key = table_key(root.table, root.id, &root.version);
+                    if !known_exact.contains(&key) {
+                        cached_roots.insert(key, root);
                     }
-                    continue;
                 }
-
-                latest_refs_to_fetch
-                    .entry(cache_key)
-                    .or_insert_with(|| reference.clone());
+                continue;
             }
+
+            latest_refs_to_fetch
+                .entry(cache_key)
+                .or_insert_with(|| reference.clone());
         }
     }
 
@@ -1179,27 +1328,21 @@ async fn fetch_latest_reference_roots(
             .iter()
             .map(|reference| reference.id)
             .collect::<Vec<_>>();
-        let rows = sqlx::query(select_by_ids_sql(table))
+        let query_sql = select_root_refs_by_ids_sql(table);
+        let rows = sqlx::query(query_sql.as_str())
             .bind(ids)
             .fetch_all(pool)
             .await?;
         let parsed_rows = rows
             .iter()
-            .map(|row| parse_package_entry_row(table, row))
+            .map(|row| parse_root_ref_row(table, row))
             .collect::<anyhow::Result<Vec<_>>>()?
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
 
-        for entry in resolve_referenced_entries_from_rows(table, &table_refs, &parsed_rows) {
-            output.insert(
-                (entry.table, entry.id),
-                PackageRootRef {
-                    table: entry.table,
-                    id: entry.id,
-                    version: entry.version,
-                },
-            );
+        for root in resolve_referenced_roots_from_rows(table, &table_refs, &parsed_rows) {
+            output.insert((root.table, root.id), root);
         }
     }
 
@@ -1320,7 +1463,35 @@ async fn list_export_seed_roots(
         FROM lca_package_export_items
         WHERE job_id = $1
           AND is_seed = TRUE
-        ORDER BY created_at ASC, table_name ASC, dataset_id ASC, version ASC
+        ORDER BY table_name ASC, dataset_id ASC, version ASC
+        ",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            let item = parse_export_item_row(row)?;
+            Ok(PackageRootRef {
+                table: item.table,
+                id: item.id,
+                version: item.version,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+}
+
+async fn list_seed_export_items_for_cache(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> anyhow::Result<Vec<PackageRootRef>> {
+    let rows = sqlx::query(
+        r"
+        SELECT table_name, dataset_id::text AS dataset_id, version
+        FROM lca_package_export_items
+        WHERE job_id = $1
+          AND is_seed = TRUE
         ",
     )
     .bind(job_id)
@@ -1345,7 +1516,28 @@ async fn list_export_items(pool: &PgPool, job_id: Uuid) -> anyhow::Result<Vec<Pa
         SELECT table_name, dataset_id::text AS dataset_id, version
         FROM lca_package_export_items
         WHERE job_id = $1
-        ORDER BY created_at ASC, table_name ASC, dataset_id ASC, version ASC
+        ORDER BY table_name ASC, dataset_id ASC, version ASC
+        ",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter()
+        .map(parse_export_item_row)
+        .collect::<anyhow::Result<Vec<_>>>()
+}
+
+async fn list_non_seed_export_items(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> anyhow::Result<Vec<PackageExportItem>> {
+    let rows = sqlx::query(
+        r"
+        SELECT table_name, dataset_id::text AS dataset_id, version
+        FROM lca_package_export_items
+        WHERE job_id = $1
+          AND is_seed = FALSE
         ",
     )
     .bind(job_id)
@@ -1439,6 +1631,7 @@ fn export_progress_diagnostics(
     value
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn execute_import_package(
     state: &AppState,
     job_id: Uuid,
@@ -1583,10 +1776,10 @@ async fn collect_package_entries(
     scope: PackageExportScope,
     roots: &[PackageRootRef],
 ) -> anyhow::Result<CollectedPackageEntries> {
-    let seed_entries = if !roots.is_empty() {
-        fetch_rows_by_exact_roots(&state.pool, roots).await?
-    } else {
+    let seed_entries = if roots.is_empty() {
         fetch_scope_roots(&state.pool, requested_by, scope).await?
+    } else {
+        fetch_rows_by_exact_roots(&state.pool, roots).await?
     };
 
     if !roots.is_empty() {
@@ -1644,9 +1837,7 @@ async fn collect_package_entries(
         }
     }
 
-    let resolved_roots = if !roots.is_empty() {
-        roots.to_vec()
-    } else {
+    let resolved_roots = if roots.is_empty() {
         sort_entries(collected.values().cloned().collect())
             .into_iter()
             .map(|entry| PackageRootRef {
@@ -1655,6 +1846,8 @@ async fn collect_package_entries(
                 version: entry.version,
             })
             .collect()
+    } else {
+        roots.to_vec()
     };
 
     Ok(CollectedPackageEntries {
@@ -1794,6 +1987,7 @@ async fn find_conflicts(pool: &PgPool, entries: &[PackageEntry]) -> anyhow::Resu
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn insert_entries(
     pool: &PgPool,
     requested_by: Uuid,
@@ -1940,9 +2134,8 @@ async fn fetch_rows_by_exact_roots(
             .fetch_all(pool)
             .await?;
         for row in rows {
-            let entry = match parse_package_entry_row(table, &row)? {
-                Some(entry) => entry,
-                None => continue,
+            let Some(entry) = parse_package_entry_row(table, &row)? else {
+                continue;
             };
             if expected_keys.contains(&table_key(entry.table, entry.id, &entry.version)) {
                 output.push(entry);
@@ -1953,6 +2146,74 @@ async fn fetch_rows_by_exact_roots(
     Ok(dedupe_entries(output))
 }
 
+async fn fetch_root_refs_by_exact_roots(
+    pool: &PgPool,
+    roots: &[PackageRootRef],
+) -> anyhow::Result<Vec<PackageRootRef>> {
+    let mut grouped = BTreeMap::<PackageRootTable, Vec<PackageRootRef>>::new();
+    for root in roots {
+        grouped.entry(root.table).or_default().push(root.clone());
+    }
+
+    let mut output = Vec::new();
+    for (table, table_roots) in grouped {
+        let ids = table_roots.iter().map(|root| root.id).collect::<Vec<_>>();
+        let expected_keys = table_roots
+            .iter()
+            .map(|root| table_key(root.table, root.id, &root.version))
+            .collect::<HashSet<_>>();
+        let query_sql = select_root_refs_by_ids_sql(table);
+        let rows = sqlx::query(query_sql.as_str())
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+        for row in rows {
+            let Some(root) = parse_root_ref_row(table, &row)? else {
+                continue;
+            };
+            if expected_keys.contains(&table_key(root.table, root.id, &root.version)) {
+                output.push(root);
+            }
+        }
+    }
+
+    Ok(dedupe_root_refs(output))
+}
+
+async fn fetch_reference_scan_rows_by_exact_roots(
+    pool: &PgPool,
+    roots: &[PackageRootRef],
+) -> anyhow::Result<Vec<PackageSeedScanEntry>> {
+    let mut grouped = BTreeMap::<PackageRootTable, Vec<PackageRootRef>>::new();
+    for root in roots {
+        grouped.entry(root.table).or_default().push(root.clone());
+    }
+
+    let mut output = Vec::new();
+    for (table, table_roots) in grouped {
+        let ids = table_roots.iter().map(|root| root.id).collect::<Vec<_>>();
+        let expected_keys = table_roots
+            .iter()
+            .map(|root| table_key(root.table, root.id, &root.version))
+            .collect::<HashSet<_>>();
+        let query_sql = select_reference_scan_by_ids_sql(table);
+        let rows = sqlx::query(query_sql.as_str())
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+        for row in rows {
+            let Some(entry) = parse_seed_scan_entry_row(table, &row)? else {
+                continue;
+            };
+            if expected_keys.contains(&table_key(entry.table, entry.id, &entry.version)) {
+                output.push(entry);
+            }
+        }
+    }
+
+    Ok(output)
+}
+
 #[allow(dead_code)]
 async fn fetch_scope_roots(
     pool: &PgPool,
@@ -1960,8 +2221,9 @@ async fn fetch_scope_roots(
     scope: PackageExportScope,
 ) -> anyhow::Result<Vec<PackageEntry>> {
     match scope {
-        PackageExportScope::CurrentUser => fetch_scope_entries(pool, requested_by, scope).await,
-        PackageExportScope::OpenData => fetch_scope_entries(pool, requested_by, scope).await,
+        PackageExportScope::CurrentUser | PackageExportScope::OpenData => {
+            fetch_scope_entries(pool, requested_by, scope).await
+        }
         PackageExportScope::CurrentUserAndOpenData => {
             let current_user =
                 fetch_scope_entries(pool, requested_by, PackageExportScope::CurrentUser).await?;
@@ -2084,6 +2346,32 @@ async fn fetch_model_processes(
         .map(|entries| entries.into_iter().flatten().collect())
 }
 
+async fn fetch_model_process_roots(
+    pool: &PgPool,
+    model_id: Uuid,
+    version: &str,
+) -> anyhow::Result<Vec<PackageRootRef>> {
+    let rows = sqlx::query(
+        r"
+        SELECT
+            id::text AS id,
+            version::text AS version
+        FROM processes
+        WHERE model_id = $1
+          AND version = $2
+        ",
+    )
+    .bind(model_id)
+    .bind(version)
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter()
+        .map(|row| parse_root_ref_row(PackageRootTable::Processes, row))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(|roots| roots.into_iter().flatten().collect())
+}
+
 async fn fetch_process_model(
     pool: &PgPool,
     model_id: Uuid,
@@ -2128,6 +2416,43 @@ async fn fetch_process_model(
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| compare_versions(&right.version, &left.version));
     Ok(entries.into_iter().take(1).collect())
+}
+
+async fn fetch_process_model_roots(
+    pool: &PgPool,
+    model_id: Uuid,
+    version: &str,
+) -> anyhow::Result<Vec<PackageRootRef>> {
+    let exact = fetch_root_refs_by_exact_roots(
+        pool,
+        &[PackageRootRef {
+            table: PackageRootTable::Lifecyclemodels,
+            id: model_id,
+            version: version.to_owned(),
+        }],
+    )
+    .await?;
+    if !exact.is_empty() {
+        return Ok(exact);
+    }
+
+    let query_sql = select_root_refs_by_ids_sql(PackageRootTable::Lifecyclemodels);
+    let rows = sqlx::query(query_sql.as_str())
+        .bind(vec![model_id])
+        .fetch_all(pool)
+        .await?;
+    let parsed = rows
+        .iter()
+        .map(|row| parse_root_ref_row(PackageRootTable::Lifecyclemodels, row))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    Ok(resolve_exact_or_latest_roots(
+        PackageRootTable::Lifecyclemodels,
+        &[(model_id, version.to_owned())],
+        &parsed,
+    ))
 }
 
 async fn fetch_package_artifact(
@@ -2215,6 +2540,7 @@ fn parse_legacy_package_entries<R: Read + Seek>(
     Ok(dedupe_entries(entries))
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn normalize_imported_entry(
     table: PackageRootTable,
     value: Value,
@@ -2223,13 +2549,12 @@ fn normalize_imported_entry(
         return Ok(None);
     };
 
-    let id = match candidate
+    let Some(id) = candidate
         .get("id")
         .and_then(Value::as_str)
         .and_then(parse_uuid_opt)
-    {
-        Some(id) => id,
-        None => return Ok(None),
+    else {
+        return Ok(None);
     };
     let version = normalize_version_string(
         candidate
@@ -2377,7 +2702,17 @@ fn extract_model_submodels(entry: &PackageEntry) -> Vec<ReferenceTarget> {
     let Some(json_tg) = &entry.json_tg else {
         return Vec::new();
     };
-    let Some(submodels) = json_tg.get("submodels").and_then(Value::as_array) else {
+    extract_model_submodels_from_value(
+        &entry.version,
+        json_tg.get("submodels").unwrap_or(&Value::Null),
+    )
+}
+
+fn extract_model_submodels_from_value(
+    parent_version: &str,
+    submodels: &Value,
+) -> Vec<ReferenceTarget> {
+    let Some(submodels) = submodels.as_array() else {
         return Vec::new();
     };
 
@@ -2394,7 +2729,7 @@ fn extract_model_submodels(entry: &PackageEntry) -> Vec<ReferenceTarget> {
                 .and_then(Value::as_str)
                 .map(normalize_version_string)
                 .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| entry.version.clone());
+                .unwrap_or_else(|| parent_version.to_owned());
             Some(ReferenceTarget {
                 table: PackageRootTable::Processes,
                 id,
@@ -2404,6 +2739,7 @@ fn extract_model_submodels(entry: &PackageEntry) -> Vec<ReferenceTarget> {
         .collect()
 }
 
+#[must_use]
 pub fn normalize_version_string(value: &str) -> String {
     let raw = value.trim();
     if raw.is_empty() {
@@ -2465,9 +2801,7 @@ fn resolve_referenced_entries_from_rows(
 ) -> Vec<PackageEntry> {
     let mut requested_by_id = HashMap::<Uuid, RequestedVersions>::new();
     for reference in refs.iter().filter(|reference| reference.table == table) {
-        let current = requested_by_id
-            .entry(reference.id)
-            .or_insert_with(RequestedVersions::default);
+        let current = requested_by_id.entry(reference.id).or_default();
         if let Some(version) = &reference.version {
             current.versions.insert(normalize_version_string(version));
         } else {
@@ -2502,6 +2836,96 @@ fn resolve_referenced_entries_from_rows(
             && let Some(latest) = candidates.first()
         {
             output.insert(table_key(table, latest.id, &latest.version), latest.clone());
+        }
+    }
+
+    output.into_values().collect()
+}
+
+fn resolve_referenced_roots_from_rows(
+    table: PackageRootTable,
+    refs: &[ReferenceTarget],
+    rows: &[PackageRootRef],
+) -> Vec<PackageRootRef> {
+    let mut requested_by_id = HashMap::<Uuid, RequestedVersions>::new();
+    for reference in refs.iter().filter(|reference| reference.table == table) {
+        let current = requested_by_id.entry(reference.id).or_default();
+        if let Some(version) = &reference.version {
+            current.versions.insert(normalize_version_string(version));
+        } else {
+            current.wants_latest = true;
+        }
+    }
+
+    let mut roots_by_id = HashMap::<Uuid, Vec<PackageRootRef>>::new();
+    for row in rows.iter().filter(|root| root.table == table) {
+        roots_by_id.entry(row.id).or_default().push(row.clone());
+    }
+
+    let mut output = BTreeMap::<String, PackageRootRef>::new();
+    for (id, requested) in requested_by_id {
+        let mut candidates = roots_by_id.get(&id).cloned().unwrap_or_default();
+        if candidates.is_empty() {
+            continue;
+        }
+        candidates.sort_by(|left, right| compare_versions(&right.version, &left.version));
+
+        let by_version = candidates
+            .iter()
+            .map(|root| (normalize_version_string(&root.version), root.clone()))
+            .collect::<HashMap<_, _>>();
+        for version in requested.versions {
+            if let Some(root) = by_version.get(&version) {
+                output.insert(table_key(table, root.id, &root.version), root.clone());
+            }
+        }
+
+        if requested.wants_latest
+            && let Some(latest) = candidates.first()
+        {
+            output.insert(table_key(table, latest.id, &latest.version), latest.clone());
+        }
+    }
+
+    output.into_values().collect()
+}
+
+fn resolve_exact_or_latest_roots(
+    table: PackageRootTable,
+    requested: &[(Uuid, String)],
+    rows: &[PackageRootRef],
+) -> Vec<PackageRootRef> {
+    let mut requested_by_id = HashMap::<Uuid, HashSet<String>>::new();
+    for (id, version) in requested {
+        requested_by_id
+            .entry(*id)
+            .or_default()
+            .insert(normalize_version_string(version));
+    }
+
+    let mut roots_by_id = HashMap::<Uuid, Vec<PackageRootRef>>::new();
+    for row in rows.iter().filter(|root| root.table == table) {
+        roots_by_id.entry(row.id).or_default().push(row.clone());
+    }
+
+    let mut output = BTreeMap::<String, PackageRootRef>::new();
+    for (id, versions) in requested_by_id {
+        let mut candidates = roots_by_id.get(&id).cloned().unwrap_or_default();
+        if candidates.is_empty() {
+            continue;
+        }
+        candidates.sort_by(|left, right| compare_versions(&right.version, &left.version));
+        let by_version = candidates
+            .iter()
+            .map(|root| (normalize_version_string(&root.version), root.clone()))
+            .collect::<HashMap<_, _>>();
+
+        for version in versions {
+            if let Some(exact) = by_version.get(&version) {
+                output.insert(table_key(table, exact.id, &exact.version), exact.clone());
+            } else if let Some(latest) = candidates.first() {
+                output.insert(table_key(table, latest.id, &latest.version), latest.clone());
+            }
         }
     }
 
@@ -2560,6 +2984,14 @@ fn dedupe_entries(entries: Vec<PackageEntry>) -> Vec<PackageEntry> {
     let mut map = BTreeMap::<String, PackageEntry>::new();
     for entry in entries {
         map.insert(table_key(entry.table, entry.id, &entry.version), entry);
+    }
+    map.into_values().collect()
+}
+
+fn dedupe_root_refs(roots: Vec<PackageRootRef>) -> Vec<PackageRootRef> {
+    let mut map = BTreeMap::<String, PackageRootRef>::new();
+    for root in roots {
+        map.insert(table_key(root.table, root.id, &root.version), root);
     }
     map.into_values().collect()
 }
@@ -2672,6 +3104,29 @@ fn parse_artifact_kind(value: &str) -> Option<PackageArtifactKind> {
     }
 }
 
+fn select_root_refs_by_ids_sql(table: PackageRootTable) -> String {
+    format!(
+        r"
+        SELECT
+            id::text AS id,
+            version::text AS version
+        FROM {}
+        WHERE id = ANY($1::uuid[])
+        ",
+        table_name(table)
+    )
+}
+
+fn select_reference_scan_by_ids_sql(table: PackageRootTable) -> String {
+    format!(
+        r"
+        {}
+        WHERE id = ANY($1::uuid[])
+        ",
+        scope_seed_scan_select_prefix_sql(table)
+    )
+}
+
 fn select_by_ids_sql(table: PackageRootTable) -> &'static str {
     match table {
         PackageRootTable::Contacts => {
@@ -2768,91 +3223,127 @@ fn select_by_ids_sql(table: PackageRootTable) -> &'static str {
     }
 }
 
-fn scope_select_prefix_sql(table: PackageRootTable) -> &'static str {
+#[allow(clippy::too_many_lines)]
+fn scope_seed_scan_select_prefix_sql(table: PackageRootTable) -> &'static str {
     match table {
         PackageRootTable::Contacts => {
-            r"
+            r#"
             SELECT
                 id::text AS id,
                 version::text AS version,
-                json_ordered,
-                rule_verification,
-                NULL::jsonb AS json_tg,
+                COALESCE(
+                    jsonb_path_query_array(
+                        json_ordered::jsonb,
+                        '$.** ? (exists (@."@refObjectId") && exists (@."@type"))'
+                    ),
+                    '[]'::jsonb
+                ) AS ref_candidates,
+                '[]'::jsonb AS submodels,
                 NULL::text AS model_id
             FROM contacts
-            "
+            "#
         }
         PackageRootTable::Sources => {
-            r"
+            r#"
             SELECT
                 id::text AS id,
                 version::text AS version,
-                json_ordered,
-                rule_verification,
-                NULL::jsonb AS json_tg,
+                COALESCE(
+                    jsonb_path_query_array(
+                        json_ordered::jsonb,
+                        '$.** ? (exists (@."@refObjectId") && exists (@."@type"))'
+                    ),
+                    '[]'::jsonb
+                ) AS ref_candidates,
+                '[]'::jsonb AS submodels,
                 NULL::text AS model_id
             FROM sources
-            "
+            "#
         }
         PackageRootTable::Unitgroups => {
-            r"
+            r#"
             SELECT
                 id::text AS id,
                 version::text AS version,
-                json_ordered,
-                rule_verification,
-                NULL::jsonb AS json_tg,
+                COALESCE(
+                    jsonb_path_query_array(
+                        json_ordered::jsonb,
+                        '$.** ? (exists (@."@refObjectId") && exists (@."@type"))'
+                    ),
+                    '[]'::jsonb
+                ) AS ref_candidates,
+                '[]'::jsonb AS submodels,
                 NULL::text AS model_id
             FROM unitgroups
-            "
+            "#
         }
         PackageRootTable::Flowproperties => {
-            r"
+            r#"
             SELECT
                 id::text AS id,
                 version::text AS version,
-                json_ordered,
-                rule_verification,
-                NULL::jsonb AS json_tg,
+                COALESCE(
+                    jsonb_path_query_array(
+                        json_ordered::jsonb,
+                        '$.** ? (exists (@."@refObjectId") && exists (@."@type"))'
+                    ),
+                    '[]'::jsonb
+                ) AS ref_candidates,
+                '[]'::jsonb AS submodels,
                 NULL::text AS model_id
             FROM flowproperties
-            "
+            "#
         }
         PackageRootTable::Flows => {
-            r"
+            r#"
             SELECT
                 id::text AS id,
                 version::text AS version,
-                json_ordered,
-                rule_verification,
-                NULL::jsonb AS json_tg,
+                COALESCE(
+                    jsonb_path_query_array(
+                        json_ordered::jsonb,
+                        '$.** ? (exists (@."@refObjectId") && exists (@."@type"))'
+                    ),
+                    '[]'::jsonb
+                ) AS ref_candidates,
+                '[]'::jsonb AS submodels,
                 NULL::text AS model_id
             FROM flows
-            "
+            "#
         }
         PackageRootTable::Processes => {
-            r"
+            r#"
             SELECT
                 id::text AS id,
                 version::text AS version,
-                json_ordered,
-                rule_verification,
-                NULL::jsonb AS json_tg,
+                COALESCE(
+                    jsonb_path_query_array(
+                        json_ordered::jsonb,
+                        '$.** ? (exists (@."@refObjectId") && exists (@."@type"))'
+                    ),
+                    '[]'::jsonb
+                ) AS ref_candidates,
+                '[]'::jsonb AS submodels,
                 model_id::text AS model_id
             FROM processes
-            "
+            "#
         }
         PackageRootTable::Lifecyclemodels => {
-            r"
+            r#"
             SELECT
                 id::text AS id,
                 version::text AS version,
-                json_ordered,
-                rule_verification,
-                json_tg,
+                COALESCE(
+                    jsonb_path_query_array(
+                        json_ordered::jsonb,
+                        '$.** ? (exists (@."@refObjectId") && exists (@."@type"))'
+                    ),
+                    '[]'::jsonb
+                ) AS ref_candidates,
+                COALESCE((json_tg::jsonb)->'submodels', '[]'::jsonb) AS submodels,
                 NULL::text AS model_id
             FROM lifecyclemodels
-            "
+            "#
         }
     }
 }
@@ -3054,27 +3545,58 @@ fn select_by_open_data_sql(table: PackageRootTable) -> &'static str {
 fn conflict_select_sql(table: PackageRootTable) -> &'static str {
     match table {
         PackageRootTable::Contacts => {
-            r#"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM contacts WHERE id = ANY($1::uuid[])"#
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM contacts WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Sources => {
-            r#"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM sources WHERE id = ANY($1::uuid[])"#
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM sources WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Unitgroups => {
-            r#"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM unitgroups WHERE id = ANY($1::uuid[])"#
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM unitgroups WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Flowproperties => {
-            r#"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM flowproperties WHERE id = ANY($1::uuid[])"#
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM flowproperties WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Flows => {
-            r#"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM flows WHERE id = ANY($1::uuid[])"#
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM flows WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Processes => {
-            r#"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM processes WHERE id = ANY($1::uuid[])"#
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM processes WHERE id = ANY($1::uuid[])"
         }
         PackageRootTable::Lifecyclemodels => {
-            r#"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM lifecyclemodels WHERE id = ANY($1::uuid[])"#
+            r"SELECT id::text AS id, version::text AS version, state_code, user_id::text AS user_id FROM lifecyclemodels WHERE id = ANY($1::uuid[])"
         }
     }
+}
+
+fn parse_seed_scan_entry_row(
+    table: PackageRootTable,
+    row: &sqlx::postgres::PgRow,
+) -> anyhow::Result<Option<PackageSeedScanEntry>> {
+    let id_raw = row.try_get::<String, _>("id")?;
+    let Some(id) = parse_uuid_opt(id_raw.as_str()) else {
+        return Ok(None);
+    };
+    let version = normalize_version_string(&row.try_get::<String, _>("version")?);
+    if version.is_empty() {
+        return Ok(None);
+    }
+
+    let model_id = row
+        .try_get::<Option<String>, _>("model_id")?
+        .and_then(|raw| parse_uuid_opt(raw.as_str()));
+
+    Ok(Some(PackageSeedScanEntry {
+        table,
+        id,
+        version,
+        ref_candidates: row
+            .try_get::<Option<Value>, _>("ref_candidates")?
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+        submodels: row
+            .try_get::<Option<Value>, _>("submodels")?
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+        model_id,
+    }))
 }
 
 fn parse_package_entry_row(
@@ -3082,9 +3604,8 @@ fn parse_package_entry_row(
     row: &sqlx::postgres::PgRow,
 ) -> anyhow::Result<Option<PackageEntry>> {
     let id_raw = row.try_get::<String, _>("id")?;
-    let id = match parse_uuid_opt(id_raw.as_str()) {
-        Some(id) => id,
-        None => return Ok(None),
+    let Some(id) = parse_uuid_opt(id_raw.as_str()) else {
+        return Ok(None);
     };
     let version = normalize_version_string(&row.try_get::<String, _>("version")?);
     if version.is_empty() {
@@ -3133,11 +3654,14 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ConflictRow, PackageEntry, ReferenceTarget, normalize_version_string,
-        partition_conflicts_from_rows, plan_reference_resolution,
-        resolve_referenced_entries_from_rows,
+        ConflictRow, ExportTraversalCache, PackageEntry, ReferenceTarget,
+        clear_runtime_export_traversal_cache, extract_model_submodels_from_value,
+        load_runtime_export_traversal_cache, normalize_version_string,
+        partition_conflicts_from_rows, plan_reference_resolution, remember_root_in_traversal_cache,
+        resolve_exact_or_latest_roots, resolve_referenced_entries_from_rows,
+        store_runtime_export_traversal_cache,
     };
-    use crate::package_types::PackageRootTable;
+    use crate::package_types::{PackageRootRef, PackageRootTable};
 
     #[test]
     fn normalize_version_string_pads_numeric_versions() {
@@ -3272,7 +3796,9 @@ mod tests {
                 },
             ],
             &known_exact,
+            &HashSet::new(),
             &resolved_latest,
+            false,
         );
 
         assert!(plan.exact_roots_to_fetch.is_empty());
@@ -3298,7 +3824,9 @@ mod tests {
                 version: Some("1.1.0".to_owned()),
             }],
             &HashSet::new(),
+            &HashSet::new(),
             &HashMap::new(),
+            false,
         );
 
         assert_eq!(
@@ -3308,6 +3836,119 @@ mod tests {
                 id,
                 version: "01.01.000".to_owned(),
             }]
+        );
+    }
+
+    #[test]
+    fn plan_reference_resolution_skips_versionless_refs_for_covered_ids() {
+        let id = Uuid::from_u128(4);
+        let known_any_version = [(PackageRootTable::Flows, id)].into_iter().collect();
+
+        let plan = plan_reference_resolution(
+            &[ReferenceTarget {
+                table: PackageRootTable::Flows,
+                id,
+                version: None,
+            }],
+            &HashSet::new(),
+            &known_any_version,
+            &HashMap::new(),
+            true,
+        );
+
+        assert!(plan.cached_roots.is_empty());
+        assert!(plan.exact_roots_to_fetch.is_empty());
+        assert!(plan.latest_refs_to_fetch.is_empty());
+    }
+
+    #[test]
+    fn plan_reference_resolution_keeps_versionless_lookup_for_selected_roots() {
+        let id = Uuid::from_u128(5);
+        let known_any_version = [(PackageRootTable::Flows, id)].into_iter().collect();
+
+        let plan = plan_reference_resolution(
+            &[ReferenceTarget {
+                table: PackageRootTable::Flows,
+                id,
+                version: None,
+            }],
+            &HashSet::new(),
+            &known_any_version,
+            &HashMap::new(),
+            false,
+        );
+
+        assert!(plan.cached_roots.is_empty());
+        assert!(plan.exact_roots_to_fetch.is_empty());
+        assert_eq!(plan.latest_refs_to_fetch.len(), 1);
+        assert_eq!(plan.latest_refs_to_fetch[0].id, id);
+    }
+
+    #[test]
+    fn resolve_exact_or_latest_roots_prefers_exact_match_and_falls_back_to_latest() {
+        let exact_id = Uuid::from_u128(6);
+        let fallback_id = Uuid::from_u128(7);
+        let roots = vec![
+            PackageRootRef {
+                table: PackageRootTable::Lifecyclemodels,
+                id: exact_id,
+                version: "02.00.000".to_owned(),
+            },
+            PackageRootRef {
+                table: PackageRootTable::Lifecyclemodels,
+                id: exact_id,
+                version: "01.00.000".to_owned(),
+            },
+            PackageRootRef {
+                table: PackageRootTable::Lifecyclemodels,
+                id: fallback_id,
+                version: "03.00.000".to_owned(),
+            },
+            PackageRootRef {
+                table: PackageRootTable::Lifecyclemodels,
+                id: fallback_id,
+                version: "02.00.000".to_owned(),
+            },
+        ];
+
+        let resolved = resolve_exact_or_latest_roots(
+            PackageRootTable::Lifecyclemodels,
+            &[
+                (exact_id, "01.00.000".to_owned()),
+                (fallback_id, "01.00.000".to_owned()),
+            ],
+            &roots,
+        );
+
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|root| (root.id, root.version.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (exact_id, "01.00.000".to_owned()),
+                (fallback_id, "03.00.000".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_model_submodels_from_value_uses_parent_version_as_fallback() {
+        let process_id = Uuid::from_u128(8);
+        let refs = extract_model_submodels_from_value(
+            "02.00.000",
+            &json!([
+                {
+                    "id": process_id,
+                }
+            ]),
+        );
+
+        assert_eq!(
+            refs.iter()
+                .map(|reference| (reference.id, reference.version.clone()))
+                .collect::<Vec<_>>(),
+            vec![(process_id, Some("02.00.000".to_owned()))]
         );
     }
 
@@ -3368,5 +4009,53 @@ mod tests {
         assert_eq!(partitioned.open_data_conflicts.len(), 0);
         assert_eq!(partitioned.user_conflicts.len(), 1);
         assert_eq!(partitioned.user_conflicts[0].user_id, Some(user_id));
+    }
+
+    #[test]
+    fn runtime_export_traversal_cache_round_trips_and_clears() {
+        let job_id = Uuid::from_u128(9);
+        let process_id = Uuid::from_u128(10);
+        let flow_id = Uuid::from_u128(11);
+        clear_runtime_export_traversal_cache(job_id);
+
+        let mut cache = ExportTraversalCache::default();
+        remember_root_in_traversal_cache(
+            &mut cache,
+            &PackageRootRef {
+                table: PackageRootTable::Processes,
+                id: process_id,
+                version: "01.00.000".to_owned(),
+            },
+        );
+        let _ = cache.resolved_latest.insert(
+            (PackageRootTable::Flows, flow_id),
+            Some("02.00.000".to_owned()),
+        );
+
+        store_runtime_export_traversal_cache(job_id, &cache);
+        let loaded = load_runtime_export_traversal_cache(job_id)
+            .expect("runtime export traversal cache should exist");
+
+        assert!(loaded.known_exact.contains(&super::table_key(
+            PackageRootTable::Processes,
+            process_id,
+            "01.00.000"
+        )));
+        assert!(
+            loaded
+                .known_any_version
+                .contains(&(PackageRootTable::Processes, process_id))
+        );
+        assert_eq!(
+            loaded
+                .resolved_latest
+                .get(&(PackageRootTable::Flows, flow_id))
+                .cloned()
+                .flatten(),
+            Some("02.00.000".to_owned())
+        );
+
+        clear_runtime_export_traversal_cache(job_id);
+        assert!(load_runtime_export_traversal_cache(job_id).is_none());
     }
 }

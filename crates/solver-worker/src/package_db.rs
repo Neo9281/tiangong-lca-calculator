@@ -8,7 +8,9 @@ use uuid::Uuid;
 use crate::{
     artifacts::EncodedArtifact,
     db::AppState,
-    package_execution::{execute_export_package, execute_import_package},
+    package_execution::{
+        clear_runtime_export_traversal_cache, execute_export_package, execute_import_package,
+    },
     package_types::{PACKAGE_QUEUE_NAME, PackageArtifactKind, PackageJobPayload},
 };
 
@@ -265,6 +267,7 @@ pub async fn enqueue_package_job_payload(
 
 /// Executes one package queue payload end-to-end.
 #[instrument(skip(state))]
+#[allow(clippy::too_many_lines)]
 pub async fn handle_package_job_payload(
     state: &AppState,
     payload: PackageJobPayload,
@@ -285,8 +288,15 @@ pub async fn handle_package_job_payload(
             }
 
             let outcome =
-                execute_export_package(state, job_id, requested_by, scope, roots.as_slice())
-                    .await?;
+                match execute_export_package(state, job_id, requested_by, scope, roots.as_slice())
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        clear_runtime_export_traversal_cache(job_id);
+                        return Err(err);
+                    }
+                };
             let _ = update_package_job_status(
                 &state.pool,
                 job_id,
@@ -319,6 +329,10 @@ pub async fn handle_package_job_payload(
                     job_id = %job_id,
                     "failed to mark package request cache ready"
                 );
+            }
+
+            if outcome.final_status != "running" {
+                clear_runtime_export_traversal_cache(job_id);
             }
 
             Ok(())

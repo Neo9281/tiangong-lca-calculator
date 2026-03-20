@@ -48,7 +48,7 @@ pub enum PackageArtifactKind {
 }
 
 impl PackageArtifactKind {
-    /// Artifact format identifier stored in PostgreSQL.
+    /// Artifact format identifier stored in `PostgreSQL`.
     #[must_use]
     pub const fn artifact_format(self) -> &'static str {
         match self {
@@ -136,7 +136,9 @@ mod tests {
                 assert_eq!(roots.len(), 1);
                 assert_eq!(roots[0].version, "01.00.000");
             }
-            other => panic!("unexpected payload: {other:?}"),
+            other @ PackageJobPayload::ImportPackage { .. } => {
+                panic!("unexpected payload: {other:?}");
+            }
         }
     }
 
